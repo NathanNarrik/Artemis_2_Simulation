@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -u
 
+if [ $# -ne 2 ]; then
+  echo "Usage: $0 <sim_root> <output_file>" >&2
+  exit 2
+fi
+
+SIM_ROOT="$1"
+OUTFILE="$2"
+
+cd "$SIM_ROOT" || {
+  echo "ERROR: Could not cd to sim root: $SIM_ROOT" >&2
+  exit 1
+}
+
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
@@ -8,8 +21,8 @@ all_tags="$tmpdir/all_tags.txt"
 unique_tags="$tmpdir/unique_tags.txt"
 interim_tags="$tmpdir/interim_tags.txt"
 sorted_interims="$tmpdir/sorted_interims.txt"
-old_list="$tmpdir/old.txt"
-new_list="$tmpdir/new.txt"
+work_list="$tmpdir/work.txt"
+load_list="$tmpdir/load.txt"
 common="$tmpdir/common.txt"
 added="$tmpdir/added.txt"
 removed="$tmpdir/removed.txt"
@@ -27,6 +40,30 @@ is_interim_tag() {
     *_interim_[0-9][0-9]_[0-9][0-9]_[0-9][0-9][0-9][0-9]) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+get_tag_prefix() {
+  local tag="$1"
+  echo "${tag%_interim_*}"
+}
+
+get_today_interim_tag() {
+  local prefix="$1"
+  local today
+  today="$(date +%m_%d_%Y)"
+  echo "${prefix}_interim_${today}"
+}
+
+get_head_rev() {
+  local file="$1"
+
+  rlog -h "$file" 2>/dev/null | awk '
+    /^head:/ {
+      sub(/^head:[[:space:]]*/, "", $0)
+      print $0
+      exit
+    }
+  '
 }
 
 rev_lt() {
@@ -58,6 +95,7 @@ rev_lt() {
   return 1
 }
 
+# Only include RCS-controlled files
 list_working_files() {
   find . -type f ! -path "*/RCS/*" |
   while IFS= read -r f; do
@@ -191,8 +229,6 @@ emit_rlog_between() {
   "
 }
 
-echo "Collecting interim tags..."
-
 : > "$all_tags"
 
 while IFS= read -r f; do
@@ -222,93 +258,90 @@ awk -F_ '
 }
 ' "$interim_tags" | LC_ALL=C sort > "$sorted_interims"
 
-NEW_LOAD="$(tail -1 "$sorted_interims" | awk '{print $2}')"
-PREV_LOAD="$(tail -2 "$sorted_interims" | head -1 | awk '{print $2}')"
+LATEST_LOAD="$(tail -1 "$sorted_interims" | awk '{print $2}')"
 
-if [ -z "${NEW_LOAD:-}" ] || [ -z "${PREV_LOAD:-}" ]; then
-  echo "ERROR: Could not determine the newest and previous interim tags." >&2
+if [ -z "${LATEST_LOAD:-}" ]; then
+  echo "ERROR: Could not determine the most recent interim tag." >&2
   exit 1
 fi
 
-echo "Previous interim: $PREV_LOAD"
-echo "Newest interim:   $NEW_LOAD"
+SIM_PREFIX="$(get_tag_prefix "$LATEST_LOAD")"
+NEW_LOAD="$(get_today_interim_tag "$SIM_PREFIX")"
 
-TODAY="$(date +%m_%d_%Y)"
-OUTFILE="change_log_${NEW_LOAD}_${TODAY}.txt"
+list_working_files > "$work_list"
+list_files_in_load "$LATEST_LOAD" "$load_list"
 
-list_files_in_load "$PREV_LOAD" "$old_list"
-list_files_in_load "$NEW_LOAD" "$new_list"
-
-comm -12 "$old_list" "$new_list" > "$common"
-comm -13 "$old_list" "$new_list" > "$added"
-comm -23 "$old_list" "$new_list" > "$removed"
+comm -12 "$work_list" "$load_list" > "$common"
+comm -23 "$work_list" "$load_list" > "$added"
+comm -13 "$work_list" "$load_list" > "$removed"
 
 : > "$unchanged"
 
 {
 echo "============================================================"
-echo "CHANGE LOG: PREVIOUS INTERIM TO NEWEST INTERIM"
+echo "CHANGE LOG: INTERIM TO NEW INTERIM GENERATED TODAY"
 echo "============================================================"
-echo "Previous interim: $PREV_LOAD"
-echo "Newest interim:   $NEW_LOAD"
-echo "Run directory:    $(pwd)"
+echo "Baseline interim: $LATEST_LOAD"
+echo "New interim name: $NEW_LOAD"
+echo "Sim root:         $SIM_ROOT"
 echo "Generated:        $(date)"
 echo
-echo "This report compares the previous interim tag to the most"
-echo "recent interim tag across all RCS-controlled files."
+echo "This report compares the most recent existing interim tag"
+echo "to the current RCS HEAD state, treating the current state"
+echo "as the new interim being generated today."
 echo
 
 echo "SUMMARY COUNTS"
 echo "------------------------------------------------------------"
-echo "Files in previous interim     : $(wc -l < "$old_list" | tr -d ' ')"
-echo "Files in newest interim       : $(wc -l < "$new_list" | tr -d ' ')"
-echo "Added in newest interim       : $(wc -l < "$added" | tr -d ' ')"
-echo "Removed from previous interim : $(wc -l < "$removed" | tr -d ' ')"
+echo "RCS-controlled files now      : $(wc -l < "$work_list" | tr -d ' ')"
+echo "Files in baseline interim     : $(wc -l < "$load_list" | tr -d ' ')"
+echo "Added in new interim          : $(wc -l < "$added" | tr -d ' ')"
+echo "Removed since baseline        : $(wc -l < "$removed" | tr -d ' ')"
 echo
 
 echo "============================================================"
-echo "FILES ADDED (present in $NEW_LOAD, not in $PREV_LOAD)"
+echo "FILES ADDED (present now, not in $LATEST_LOAD)"
 echo "============================================================"
 cat "$added"
 echo
 
 echo "============================================================"
-echo "FILES REMOVED (present in $PREV_LOAD, not in $NEW_LOAD)"
+echo "FILES REMOVED (present in $LATEST_LOAD, not present now)"
 echo "============================================================"
 cat "$removed"
 echo
 
 echo "============================================================"
-echo "PER-FILE LOG ENTRIES (from $PREV_LOAD to $NEW_LOAD)"
+echo "PER-FILE LOG ENTRIES (from $LATEST_LOAD to $NEW_LOAD)"
 echo "============================================================"
 
 while IFS= read -r f; do
-  prev_rev="$(get_rev_for_tag "$f" "$PREV_LOAD")"
-  new_rev="$(get_rev_for_tag "$f" "$NEW_LOAD")"
+  load_rev="$(get_rev_for_tag "$f" "$LATEST_LOAD")"
+  head_rev="$(get_head_rev "$f")"
 
-  if [ -z "${prev_rev:-}" ] || [ -z "${new_rev:-}" ]; then
+  if [ -z "${load_rev:-}" ] || [ -z "${head_rev:-}" ]; then
     echo "------------------------------------------------------------"
     echo "FILE: $f"
-    echo "WARN: could not resolve revisions (prev='$prev_rev', new='$new_rev')"
+    echo "WARN: could not resolve revisions (baseline='$load_rev', head='$head_rev')"
     echo
     continue
   fi
 
-  if [ "$prev_rev" = "$new_rev" ]; then
+  if [ "$load_rev" = "$head_rev" ]; then
     echo "$f" >> "$unchanged"
     continue
   fi
 
   echo "------------------------------------------------------------"
   echo "FILE: $f"
-  echo "Previous revision ($PREV_LOAD): $prev_rev"
-  echo "Newest revision   ($NEW_LOAD):  $new_rev"
+  echo "Baseline revision ($LATEST_LOAD): $load_rev"
+  echo "New interim revision ($NEW_LOAD): $head_rev"
   echo
 
-  if rev_lt "$prev_rev" "$new_rev"; then
-    emit_rlog_between "$f" "$prev_rev" "$new_rev" || echo "WARN: rlog extraction failed for $f"
+  if rev_lt "$load_rev" "$head_rev"; then
+    emit_rlog_between "$f" "$load_rev" "$head_rev" || echo "WARN: rlog extraction failed for $f"
   else
-    echo "WARN: revision order is not increasing ($prev_rev -> $new_rev)"
+    echo "WARN: revision order is not increasing ($load_rev -> $head_rev)"
     echo "This may indicate a branch or unusual tag placement."
     echo "Inspect manually with: rlog $f"
     echo
@@ -316,10 +349,8 @@ while IFS= read -r f; do
 done < "$common"
 
 echo "============================================================"
-echo "FILES UNCHANGED (same revision in both interims)"
+echo "FILES UNCHANGED (same revision in $LATEST_LOAD and $NEW_LOAD)"
 echo "============================================================"
 cat "$unchanged"
 
 } > "$OUTFILE"
-
-echo "Wrote: $OUTFILE"
